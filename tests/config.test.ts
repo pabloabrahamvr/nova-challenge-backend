@@ -115,6 +115,12 @@ describe('review #9: key from a secret file (Docker/K8s secrets)', () => {
     expect(c.encryptionKey.toString('base64')).toBe(KEY);
   });
 
+  it('treats an empty inline key (as copied from .env.example) as unset when a key file is given', async () => {
+    const file = join(dir, 'key3');
+    await writeFile(file, KEY);
+    expect(loadConfig({ AUDIT_ENCRYPTION_KEY: '', AUDIT_ENCRYPTION_KEY_FILE: file }).encryptionKey.toString('base64')).toBe(KEY);
+  });
+
   it('rejects setting both the inline key and the file', async () => {
     const file = join(dir, 'key2');
     await writeFile(file, KEY);

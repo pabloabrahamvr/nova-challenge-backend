@@ -1,5 +1,21 @@
 node_modules/
 dist/
+coverage/
+
+# Secrets: any dotenv variant except the template, plus secret files and key material
 .env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Audit data and logs: never commit, wherever AUDIT_FILE_PATH points
 data/
+*.jsonl
 *.log
+
+# Editor/backup leftovers
+*.bak
+*.orig
+.DS_Store
