@@ -1,0 +1,21 @@
+# Never ship secrets, audit data or local artifacts in the build context
+.env
+.env.*
+!.env.example
+data/
+*.jsonl
+*.log
+
+node_modules/
+dist/
+coverage/
+
+.git/
+.DS_Store
+.claude/
+CLAUDE.md
+PROMPTS.md
+README.md
+Dockerfile
+compose.yaml
+.dockerignore

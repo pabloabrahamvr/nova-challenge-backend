@@ -1,0 +1,28 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: guardian-gateway:local
+    ports:
+      - "3000:3000"
+    # Secrets and tunables come from a local, git-ignored .env (copy .env.example). Compose fails
+    # with a clear error if the file is missing.
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Fixed inside the container; the named volume below persists it.
+      PORT: "3000"
+      AUDIT_FILE_PATH: /app/data/audit.jsonl
+    volumes:
+      - audit-data:/app/data
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  audit-data:
