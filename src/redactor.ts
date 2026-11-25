@@ -1,56 +1,186 @@
 /**
  * PII redactor. Pure and synchronous: no I/O, no logging.
  *
- * Order matters:
- *   1. EMAIL        - first, so digits inside an address are never read as a card/SSN.
- *   2. CREDIT_CARD  - 13-19 digits; must run before the generic 9-digit rule.
- *   3. SSN          - ddd-dd-dddd (or spaces) and any standalone 9-digit run.
- * Placeholders contain no digits, so later passes cannot re-match earlier output.
+ * Matching is done on a normalized view of the text (NFKC, invisible characters removed)
+ * so full-width digits or zero-width splitters cannot dodge the patterns. Matches are then
+ * mapped back to the ORIGINAL string, so only the sensitive spans change and all unrelated
+ * content is returned byte-for-byte.
  *
- * Design choice: fail safe. We over-redact rather than under-redact, so there is
- * no Luhn check and no SSN area-number validation (see README for known false positives).
+ * Overlap handling: candidates are claimed in priority order, and a lower-priority candidate
+ * that touches an already-claimed character is dropped entirely (never partially redacted):
+ *   1. EMAIL        - so digits inside an address are never read as a card or SSN.
+ *   2. CREDIT_CARD  - 13-19 digits, Luhn-valid; beats the generic 9-digit rule when they overlap.
+ *   3. SSN          - ddd-dd-dddd (consistent separator) or a standalone 9-digit run.
  */
 
 export type RedactionType = 'EMAIL' | 'CREDIT_CARD' | 'SSN';
 
 export interface RedactionResult {
-  /** Redacted text. Note: this is the NFKC-normalized form of the input. */
   text: string;
   counts: Record<RedactionType, number>;
 }
 
-// Dash-like separators seen in the wild: hyphen, U+2010-2015, minus sign. Space covers NBSP after NFKC.
+interface Span {
+  start: number;
+  end: number; // exclusive
+}
+
+// Hyphen, U+2010-2015 dashes and minus sign. Space covers NBSP, which NFKC maps to a space.
 const SEP = '[ \\-\\u2010-\\u2015\\u2212]';
 
-// Lookbehind anchors the match at the start of a character run, which keeps the
-// scan linear (no O(n^2) rescans of a long run of local-part characters).
+// The lookbehind anchors a match at the start of a character run, which keeps scanning linear.
 const EMAIL_RE = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/g;
-
-// 13-19 digits, optionally separated by single spaces/dashes. Bounded repetition, no nesting.
-const CARD_RE = new RegExp(`(?<!\\d)\\d(?:${SEP}?\\d){12,18}(?!\\d)`, 'g');
-
-// ddd-dd-dddd with a consistent separator, or exactly 9 digits not part of a longer run.
+// Digit groups joined by single separators. Unambiguous (separators are never digits), so linear.
+const DIGIT_RUN_RE = new RegExp(`\\d+(?:${SEP}\\d+)*`, 'g');
+// ddd-dd-dddd with one consistent separator, or exactly 9 digits that are not part of a longer run.
 const SSN_RE = new RegExp(`(?<!\\d)(?:\\d{3}(${SEP})\\d{2}\\1\\d{4}|\\d{9})(?!\\d)`, 'g');
 
-// Soft hyphen, zero-width space/joiners, word joiner, BOM: invisible chars used to split digits.
-const INVISIBLE_RE = /[­​-‍⁠﻿]/g;
+// Soft hyphen, zero-width space/joiners, word joiner, BOM.
+const INVISIBLE_RE = /^[­​-‍⁠﻿]$/;
 
-const placeholder = (type: RedactionType): string => `<REDACTED: ${type}>`;
+const CARD_MIN_DIGITS = 13;
+const CARD_MAX_DIGITS = 19;
+const CARD_MIN_GROUP = 4; // every digit group except the last must have at least 4 digits
+
+export function luhnValid(digits: string): boolean {
+  let sum = 0;
+  let double = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = digits.charCodeAt(i) - 48;
+    if (double) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
+/** NFKC-normalize per character and remember where each normalized unit came from. */
+function normalizeWithMap(input: string): { norm: string; origStart: number[]; origEnd: number[] } {
+  let norm = '';
+  const origStart: number[] = [];
+  const origEnd: number[] = [];
+  let pos = 0;
+  for (const ch of input) {
+    const end = pos + ch.length;
+    if (!INVISIBLE_RE.test(ch)) {
+      const n = ch.normalize('NFKC');
+      norm += n;
+      for (let k = 0; k < n.length; k++) {
+        origStart.push(pos);
+        origEnd.push(end);
+      }
+    }
+    pos = end;
+  }
+  return { norm, origStart, origEnd };
+}
+
+function findEmails(norm: string): Span[] {
+  return [...norm.matchAll(EMAIL_RE)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+}
+
+/**
+ * A card is a window of whole digit groups holding 13-19 digits that passes Luhn.
+ * Windows never start or end inside a group, so a number embedded in a longer digit run is left alone.
+ * When a window fails Luhn we slide, so a valid card next to unrelated digits is still found.
+ *
+ * Groups that are part of an SSN-shaped token (ddd-dd-dddd or a standalone 9-digit run) are barriers:
+ * a window may not start on, or extend across, one. Without this, "123-45-6789 4111 1111 1111 1111"
+ * could produce a Luhn-valid window like "6789 4111 1111 1111", leaving the SSN prefix and the
+ * card's last digits exposed. No real card layout contains such a group.
+ */
+function findCards(norm: string, ssnMask: Uint8Array): Span[] {
+  const isBarrier = (g: Span): boolean => {
+    for (let k = g.start; k < g.end; k++) if (ssnMask[k]) return true;
+    return false;
+  };
+  const spans: Span[] = [];
+  for (const run of norm.matchAll(DIGIT_RUN_RE)) {
+    if (run[0].length < CARD_MIN_DIGITS) continue;
+    const groups = [...run[0].matchAll(/\d+/g)].map((g) => ({
+      start: run.index + g.index,
+      end: run.index + g.index + g[0].length,
+    }));
+
+    let i = 0;
+    while (i < groups.length) {
+      if (isBarrier(groups[i]!)) {
+        i++;
+        continue;
+      }
+      let digits = '';
+      let best = -1;
+      for (let j = i; j < groups.length; j++) {
+        const g = groups[j]!;
+        if (isBarrier(g)) break;
+        if (j > i) {
+          const prev = groups[j - 1]!;
+          if (prev.end - prev.start < CARD_MIN_GROUP) break; // prev is no longer the last group
+        }
+        digits += norm.slice(g.start, g.end);
+        if (digits.length > CARD_MAX_DIGITS) break;
+        if (digits.length >= CARD_MIN_DIGITS && luhnValid(digits)) best = j; // keep the longest
+      }
+      if (best >= 0) {
+        spans.push({ start: groups[i]!.start, end: groups[best]!.end });
+        i = best + 1;
+      } else {
+        i++;
+      }
+    }
+  }
+  return spans;
+}
+
+function findSsns(norm: string): Span[] {
+  return [...norm.matchAll(SSN_RE)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+}
 
 export function redact(input: string): RedactionResult {
   const counts: Record<RedactionType, number> = { EMAIL: 0, CREDIT_CARD: 0, SSN: 0 };
+  if (input === '') return { text: '', counts };
 
-  const sub = (text: string, re: RegExp, type: RedactionType): string =>
-    text.replace(re, () => {
-      counts[type] += 1;
-      return placeholder(type);
-    });
+  const { norm, origStart, origEnd } = normalizeWithMap(input);
+  const claimed = new Uint8Array(norm.length);
+  const accepted: Array<Span & { type: RedactionType }> = [];
 
-  // NFKC folds full-width digits/@ and NBSP to ASCII so they cannot dodge the patterns.
-  let text = input.normalize('NFKC').replace(INVISIBLE_RE, '');
-  text = sub(text, EMAIL_RE, 'EMAIL');
-  text = sub(text, CARD_RE, 'CREDIT_CARD');
-  text = sub(text, SSN_RE, 'SSN');
+  const claim = (type: RedactionType, spans: Span[]): void => {
+    for (const s of spans) {
+      let free = true;
+      for (let k = s.start; k < s.end; k++) {
+        if (claimed[k]) {
+          free = false;
+          break;
+        }
+      }
+      if (!free) continue; // drop whole candidate: never redact half of an overlap
+      claimed.fill(1, s.start, s.end);
+      accepted.push({ ...s, type });
+    }
+  };
 
-  return { text, counts };
+  const ssns = findSsns(norm);
+  const ssnMask = new Uint8Array(norm.length);
+  for (const s of ssns) ssnMask.fill(1, s.start, s.end);
+
+  claim('EMAIL', findEmails(norm));
+  claim('CREDIT_CARD', findCards(norm, ssnMask));
+  claim('SSN', ssns);
+
+  accepted.sort((a, b) => a.start - b.start);
+
+  let out = '';
+  let cursor = 0;
+  for (const s of accepted) {
+    const from = Math.max(origStart[s.start]!, cursor); // clamp: one char may expand into several
+    const to = origEnd[s.end - 1]!;
+    if (to <= cursor) continue;
+    out += input.slice(cursor, from) + `<REDACTED: ${s.type}>`;
+    cursor = to;
+    counts[s.type] += 1;
+  }
+  return { text: out + input.slice(cursor), counts };
 }

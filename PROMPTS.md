@@ -116,3 +116,39 @@ A running record of the prompts given to the AI assistant (Claude Code) during t
 > Do not implement the circuit breaker yet.
 
 **Outcome:** Added `src/crypto.ts`, `src/auditStore.ts`, `.env.example`, `tests/crypto.test.ts`, `tests/auditStore.test.ts`. Fixed `tsconfig.json` (`"types": ["node"]`, required by TypeScript 7). Ran `vitest` (71 tests pass across 3 files) and `tsc --noEmit` (clean).
+
+---
+
+## Prompt 5: Standalone PII sanitizer (Luhn, no partial/overlapping redactions)
+
+**Prompt (verbatim):**
+
+> Implement a standalone TypeScript PII sanitizer.
+>
+> Requirements:
+> - Redact email addresses.
+> - Redact credit card numbers with 13–19 digits, allowing spaces or hyphens.
+> - Validate credit card candidates using the Luhn algorithm.
+> - Redact SSNs in XXX-XX-XXXX or standalone 9-digit format.
+> - Return the redacted string without changing unrelated content.
+> - Use <REDACTED: EMAIL>, <REDACTED: CREDIT_CARD>, and <REDACTED: SSN>.
+>
+> Prioritize matching to avoid partial or overlapping redactions.
+>
+> Write unit tests for:
+> - Multiple PII values in one message
+> - Different email formats
+> - Credit cards with spaces and hyphens
+> - 9-digit SSNs
+> - Invalid credit card candidates
+> - Strings without sensitive information
+> - Empty input
+> - Text surrounding sensitive values
+>
+> Explain known limitations and false positives.
+>
+> Do not implement the API yet.
+
+**Decisions changed by this prompt:** Luhn is now REQUIRED (reverses the earlier "no Luhn" recommendation), and unrelated content must be returned unchanged (so output is no longer the NFKC-normalized text).
+
+**Outcome:** Rewrote `src/redactor.ts` (same `redact()` API) and `tests/redactor.test.ts`. Matching runs on an NFKC-normalized view, but spans map back to the original string. Overlaps resolved by priority (email > card > SSN) by dropping whole losing candidates. SSN-shaped groups are barriers for card windows (found by a failing test). 111 tests pass, `tsc --noEmit` clean.
