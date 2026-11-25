@@ -1,8 +1,9 @@
 /**
  * PII redactor. Pure and synchronous: no I/O, no logging.
  *
- * Matching is done on a normalized view of the text (NFKC, invisible characters removed)
- * so full-width digits or zero-width splitters cannot dodge the patterns. Matches are then
+ * Matching is done on a normalized view of the text (NFKC, invisible characters removed,
+ * non-ASCII decimal digits mapped to ASCII, ideographic full stops mapped to '.') so
+ * full-width digits, Arabic-Indic digits or zero-width splitters cannot dodge the patterns. Matches are then
  * mapped back to the ORIGINAL string, so only the sensitive spans change and all unrelated
  * content is returned byte-for-byte.
  *
@@ -25,15 +26,22 @@ interface Span {
   end: number; // exclusive
 }
 
-// Hyphen, U+2010-2015 dashes and minus sign. Space covers NBSP, which NFKC maps to a space.
-const SEP = '[ \\-\\u2010-\\u2015\\u2212]';
+// Separators between digit groups: any whitespace (incl. newlines, NBSP), '.', '-', '/', and the
+// U+2010-2015 dashes / minus sign. Up to two in a row ("4111  1111").
+const SEP = '[\\s.\\-/\\u2010-\\u2015\\u2212]';
 
-// The lookbehind anchors a match at the start of a character run, which keeps scanning linear.
-const EMAIL_RE = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/g;
-// Digit groups joined by single separators. Unambiguous (separators are never digits), so linear.
-const DIGIT_RUN_RE = new RegExp(`\\d+(?:${SEP}\\d+)*`, 'g');
+// Email: RFC 5322 "atext" plus Unicode letters/digits in the local part (RFC 6531), IDN domains and
+// IP-literal domains. The lookbehind anchors a match at the start of a local-part run, which keeps
+// scanning linear AND guarantees we never redact only the tail of a local part.
+const LOCAL = "[\\p{L}\\p{N}._%+\\-!#$&'*/=?^`{|}~]";
+const EMAIL_RE = new RegExp(
+  `(?<!${LOCAL})${LOCAL}+@(?:(?:[\\p{L}\\p{N}-]+\\.)+[\\p{L}\\p{N}-]{2,}|\\[[A-Za-z0-9:.]{2,}\\])`,
+  'gu',
+);
+// Digit groups joined by 1-2 separators. Unambiguous (separators are never digits), so linear.
+const DIGIT_RUN_RE = new RegExp(`\\d+(?:${SEP}{1,2}\\d+)*`, 'g');
 // ddd-dd-dddd with one consistent separator, or exactly 9 digits that are not part of a longer run.
-const SSN_RE = new RegExp(`(?<!\\d)(?:\\d{3}(${SEP})\\d{2}\\1\\d{4}|\\d{9})(?!\\d)`, 'g');
+const SSN_RE = new RegExp(`(?<!\\d)(?:\\d{3}(${SEP}{1,2})\\d{2}\\1\\d{4}|\\d{9})(?!\\d)`, 'g');
 
 // Soft hyphen, zero-width space/joiners, word joiner, BOM.
 const INVISIBLE_RE = /^[­​-‍⁠﻿]$/;
@@ -57,7 +65,26 @@ export function luhnValid(digits: string): boolean {
   return sum % 10 === 0;
 }
 
-/** NFKC-normalize per character and remember where each normalized unit came from. */
+const DECIMAL_DIGIT_RE = /^\p{Nd}$/u;
+const isDecimalDigit = (cp: number): boolean => cp >= 0 && DECIMAL_DIGIT_RE.test(String.fromCodePoint(cp));
+
+/** Value of a non-ASCII decimal digit. Unicode lays Nd digits out in aligned runs of ten starting at zero. */
+function digitValue(cp: number): number {
+  let start = cp;
+  while (isDecimalDigit(start - 1)) start--;
+  return (cp - start) % 10;
+}
+
+/** Fold one character to the form the patterns expect. */
+function foldChar(ch: string): string {
+  const cp = ch.codePointAt(0)!;
+  if (cp < 0x80) return ch;
+  if (ch === '\u3002' || ch === '\uFF61') return '.'; // ideographic full stops
+  if (isDecimalDigit(cp)) return String(digitValue(cp)); // Arabic-Indic, Devanagari, Thai, math digits...
+  return ch.normalize('NFKC');
+}
+
+/** Fold per character and remember where each folded unit came from in the original string. */
 function normalizeWithMap(input: string): { norm: string; origStart: number[]; origEnd: number[] } {
   let norm = '';
   const origStart: number[] = [];
@@ -66,7 +93,7 @@ function normalizeWithMap(input: string): { norm: string; origStart: number[]; o
   for (const ch of input) {
     const end = pos + ch.length;
     if (!INVISIBLE_RE.test(ch)) {
-      const n = ch.normalize('NFKC');
+      const n = foldChar(ch);
       norm += n;
       for (let k = 0; k < n.length; k++) {
         origStart.push(pos);

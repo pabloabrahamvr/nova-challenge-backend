@@ -233,3 +233,102 @@ describe('safety', () => {
     for (const s of secrets) expect(text).not.toContain(s);
   });
 });
+
+// ---- Security review regressions (findings 1-3) ----
+
+describe('review #1: email forms that used to bypass or be partially redacted', () => {
+  it.each([
+    ['non-ASCII local part', 'mail josé@example.com now', `mail ${EMAIL} now`],
+    ['CJK local part', '联系 王小明@example.com', `联系 ${EMAIL}`],
+    ['IDN domain', 'mail john@exämple.com now', `mail ${EMAIL} now`],
+    ['punycode TLD', 'john@example.xn--p1ai', EMAIL],
+    ['IPv4 literal domain', 'mail john@[192.168.0.1] now', `mail ${EMAIL} now`],
+    ['IPv6 literal domain', 'john@[IPv6:2001:db8::1]', EMAIL],
+    ['ideographic full stop', 'mail john@example。com now', `mail ${EMAIL} now`],
+    ['half-width ideographic full stop', 'john@example｡com', EMAIL],
+    ['full-width full stop', 'john@example．com', EMAIL],
+    ["apostrophe local part", "mail o'brien@example.com now", `mail ${EMAIL} now`],
+    ['special atext characters', 'mail a!b#c$d%e&f*g/h=i?j^k`l{m|n}o~p@example.com now', `mail ${EMAIL} now`],
+  ])('%s', (_label, input, expected) => {
+    expect(out(input)).toBe(expected);
+  });
+
+  it('never leaves a prefix of the local part behind', () => {
+    for (const local of ["o'brien", 'a!b#c', 'josé', 'x+y', 'a_b-c.d']) {
+      const text = out(`hello ${local}@example.com bye`);
+      expect(text).toBe(`hello ${EMAIL} bye`);
+    }
+  });
+
+  it('still leaves non-emails alone', () => {
+    const text = 'meet @ noon, user@localhost, foo@bar, @handle, 5@6';
+    expect(out(text)).toBe(text);
+  });
+});
+
+describe('review #2: card and SSN separator bypasses', () => {
+  it.each([
+    ['4111.1111.1111.1111', CARD],
+    ['4111/1111/1111/1111', CARD],
+    ['4111\n1111\n1111\n1111', CARD],
+    ['4111\t1111\t1111\t1111', CARD],
+    ['4111  1111  1111  1111', CARD],
+    ['3782.822463.10005', CARD],
+    ['123.45.6789', SSN],
+    ['123/45/6789', SSN],
+    ['123  45  6789', SSN],
+    ['123\n45\n6789', SSN],
+  ])('%j', (input, expected) => {
+    expect(out(input)).toBe(expected);
+  });
+
+  it('still requires one consistent separator for SSNs', () => {
+    for (const text of ['123-45.6789', '123.45 6789', '123-45/6789']) expect(out(text)).toBe(text);
+  });
+
+  it('does not over-redact common dotted/slashed non-PII numbers', () => {
+    for (const text of ['192.168.100.200', 'version 1.2.3.4', '10/12/2024', '3.14159265', '1.2.3', 'v10.20.30']) {
+      expect(out(text)).toBe(text);
+    }
+  });
+});
+
+describe('review #3: non-ASCII decimal digits', () => {
+  it.each([
+    ['Arabic-Indic SSN', 'ssn ١٢٣-٤٥-٦٧٨٩', `ssn ${SSN}`],
+    ['Arabic-Indic 9 digits', 'ssn ١٢٣٤٥٦٧٨٩', `ssn ${SSN}`],
+    ['Extended Arabic-Indic', '۱۲۳۴۵۶۷۸۹', SSN],
+    ['Devanagari', '१२३-४५-६७८९', SSN],
+    ['Thai', '๑๒๓๔๕๖๗๘๙', SSN],
+    ['Bengali card', '৪১১১ ১১১১ ১১১১ ১১১১', CARD],
+    ['mathematical bold digits', '𝟒𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏𝟏', CARD],
+    ['mixed ASCII + Arabic-Indic', '4111 ١١١١ 1111 ١١١١', CARD],
+  ])('%s', (_label, input, expected) => {
+    expect(out(input)).toBe(expected);
+  });
+
+  it('keeps surrounding non-ASCII text untouched', () => {
+    expect(out('الرقم ١٢٣٤٥٦٧٨٩ شكرا')).toBe(`الرقم ${SSN} شكرا`);
+  });
+});
+
+describe('review: performance of the widened patterns on max-size input', () => {
+  it('stays fast', () => {
+    const inputs = [
+      'é'.repeat(4000),
+      "a'".repeat(2000),
+      '/'.repeat(4000),
+      '.'.repeat(4000),
+      '1.'.repeat(2000),
+      '1/'.repeat(2000),
+      `${'a'.repeat(2000)}@${'b.'.repeat(1000)}`,
+      '\n'.repeat(4000),
+      '١'.repeat(4000),
+      ('1111 ' + '\n').repeat(700),
+      'a@'.repeat(2000),
+    ];
+    const start = performance.now();
+    for (const i of inputs) redact(i);
+    expect(performance.now() - start).toBeLessThan(1500);
+  });
+});

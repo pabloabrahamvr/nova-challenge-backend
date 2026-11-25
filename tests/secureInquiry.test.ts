@@ -6,9 +6,10 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { ProviderError, createMockProvider, type AiProvider } from '../src/aiProvider.js';
-import { createAuditLog, type AuditLog, type AuditRecord } from '../src/auditStore.js';
+import { auditAad, createAuditLog, type AuditLog, type AuditRecord } from '../src/auditStore.js';
 import { CircuitBreaker } from '../src/circuitBreaker.js';
-import { decrypt } from '../src/crypto.js';
+import { decrypt } from './helpers/crypto.js';
+import type { RateLimitOptions } from '../src/rateLimit.js';
 
 const key = randomBytes(32);
 const COOLDOWN = 10_000;
@@ -17,19 +18,24 @@ const CARD = '4111 1111 1111 1111';
 const SSN = '123-45-6789';
 const PII_MESSAGE = `Mail ${EMAIL}, card ${CARD}, ssn ${SSN}, alt 987654321`;
 const PII_FRAGMENTS = [EMAIL, '4111', SSN, '987654321'];
+const open = (r: AuditRecord): string => decrypt(r.encryptedOriginalMessage, key, auditAad(r));
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 interface StubProvider extends AiProvider {
   received: string[];
+  signals: Array<AbortSignal | undefined>;
 }
 
 /** Records what it was sent; behaviour is set by the test. */
 function stubProvider(impl: (call: number) => Promise<string> = async () => 'Generated Answer'): StubProvider {
   const received: string[] = [];
+  const signals: Array<AbortSignal | undefined> = [];
   return {
     received,
-    generate(message) {
+    signals,
+    generate(message, signal) {
       received.push(message);
+      signals.push(signal);
       return impl(received.length);
     },
   };
@@ -50,15 +56,23 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-function build(opts: { provider?: AiProvider; auditLog?: AuditLog; timeoutMs?: number } = {}) {
-  const breaker = new CircuitBreaker({ failureThreshold: 3, cooldownMs: COOLDOWN, now: () => clock });
+function build(
+  opts: { provider?: AiProvider; auditLog?: AuditLog; timeoutMs?: number; maxConcurrent?: number; rateLimit?: RateLimitOptions } = {},
+) {
+  const breaker = new CircuitBreaker({
+    failureThreshold: 3,
+    cooldownMs: COOLDOWN,
+    callTimeoutMs: opts.timeoutMs ?? 5000,
+    ...(opts.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
+    now: () => clock,
+  });
   const provider = opts.provider ?? stubProvider();
   const auditLog = opts.auditLog ?? createAuditLog({ filePath: file, key });
   const app = createApp({
     auditLog,
     provider,
     breaker,
-    providerTimeoutMs: opts.timeoutMs ?? 5000,
+    ...(opts.rateLimit ? { rateLimit: opts.rateLimit } : {}),
     log: (entry) => logs.push(entry),
   });
   return { app, breaker, provider };
@@ -107,7 +121,7 @@ describe('success', () => {
       providerStatus: 'success',
       redactedMessage: 'Hello <REDACTED: EMAIL>',
     });
-    expect(decrypt(rec!.encryptedOriginalMessage, key, rec!.requestId)).toBe(message);
+    expect(open(rec!)).toBe(message);
   });
 
   it('gives each request its own requestId', async () => {
@@ -143,7 +157,7 @@ describe('redaction', () => {
     expectNoPii(await readFile(file, 'utf8'));
     expectNoPii(res.body);
     expectNoPii(logs);
-    expect(decrypt(rec!.encryptedOriginalMessage, key, rec!.requestId)).toBe(PII_MESSAGE);
+    expect(open(rec!)).toBe(PII_MESSAGE);
   });
 });
 
@@ -229,7 +243,7 @@ describe('AI provider failures', () => {
     expect(res.body).toEqual({ requestId: expect.stringMatching(UUID), status: 'failed', error: 'Service Unavailable' });
     const [rec] = await records();
     expect(rec).toMatchObject({ requestId: res.body.requestId, providerStatus: 'failed' });
-    expect(decrypt(rec!.encryptedOriginalMessage, key, rec!.requestId)).toBe(PII_MESSAGE);
+    expect(open(rec!)).toBe(PII_MESSAGE);
   });
 
   it('does not leak PII carried by a provider error message', async () => {
@@ -311,7 +325,7 @@ describe('circuit breaker fallback', () => {
 
     const recs = await records();
     expect(recs.map((r) => r.providerStatus)).toEqual(['failed', 'failed', 'failed', 'breaker_open', 'success']);
-    for (const r of recs) expect(decrypt(r.encryptedOriginalMessage, key, r.requestId)).toBe(PII_MESSAGE);
+    for (const r of recs) expect(open(r)).toBe(PII_MESSAGE);
     expectNoPii(await readFile(file, 'utf8'));
   });
 
@@ -445,5 +459,235 @@ describe('logging', () => {
     expectNoPii(text);
     expect(text).not.toContain('secret-user');
     expect(text).not.toContain('Mail ');
+  });
+});
+
+// ---- Security review regressions ----
+
+describe('review #4: userId must not carry PII into the plaintext audit log', () => {
+  it.each([
+    ['an SSN with hyphens', '123-45-6789'],
+    ['a 9-digit SSN', '123456789'],
+    ['a card number', '4111111111111111'],
+    ['a dotted SSN', '123.45.6789'],
+  ])('400 for a userId that is %s, and nothing is audited', async (_label, userId) => {
+    const provider = stubProvider();
+    const { app } = build({ provider });
+    const res = await post(app, { userId, message: 'hi' });
+    expect(res.status).toBe(400);
+    expect(res.body.fields).toEqual(['userId']);
+    expect(JSON.stringify(res.body)).not.toContain(userId);
+    expect(provider.received).toHaveLength(0);
+    expect(await records()).toHaveLength(0);
+  });
+
+  it.each(['user-123', 'john.doe', 'svc:billing', 'a_b-c', 'USER42', '12345678'])('still accepts a normal id: %s', async (userId) => {
+    const { app } = build();
+    expect((await post(app, { userId, message: 'hi' })).status).toBe(200);
+  });
+});
+
+describe('review #16: message validation', () => {
+  const raw = (app: ReturnType<typeof build>['app'], json: string) =>
+    request(app).post('/secure-inquiry').set('Content-Type', 'application/json').send(json);
+
+  it.each([
+    ['whitespace only', '{"userId":"u1","message":"   \\n\\t "}'],
+    ['a lone high surrogate', '{"userId":"u1","message":"bad \\ud800 char"}'],
+    ['a lone low surrogate', '{"userId":"u1","message":"bad \\udc00 char"}'],
+    ['a NUL character', '{"userId":"u1","message":"a\\u0000b"}'],
+    ['an escape character', '{"userId":"u1","message":"a\\u001bb"}'],
+    ['a DEL character', '{"userId":"u1","message":"a\\u007fb"}'],
+  ])('400 for %s', async (_label, json) => {
+    const provider = stubProvider();
+    const { app } = build({ provider });
+    const res = await raw(app, json);
+    expect(res.status).toBe(400);
+    expect(res.body.fields).toEqual(['message']);
+    expect(provider.received).toHaveLength(0);
+    expect(await records()).toHaveLength(0);
+  });
+
+  it('still accepts newlines, tabs, emoji (surrogate PAIRS) and non-Latin text', async () => {
+    const message = 'line1\nline2\tcol 🔐 日本語 العربية';
+    const { app } = build();
+    const res = await post(app, { userId: 'u1', message });
+    expect(res.status).toBe(200);
+    const [rec] = await records();
+    expect(open(rec!)).toBe(message); // exact round trip, nothing silently altered
+  });
+});
+
+describe('review #14: HTTP semantics', () => {
+  it.each(['get', 'put', 'delete', 'patch'] as const)('405 with Allow: POST for %s /secure-inquiry', async (method) => {
+    const { app } = build();
+    const res = await request(app)[method]('/secure-inquiry');
+    expect(res.status).toBe(405);
+    expect(res.headers.allow).toBe('POST');
+    expect(res.body.error).toBe('Method Not Allowed');
+  });
+
+  it('405 for POST /health', async () => {
+    const { app } = build();
+    const res = await request(app).post('/health').send({});
+    expect(res.status).toBe(405);
+    expect(res.headers.allow).toContain('GET');
+  });
+
+  it('404, not 415, for a POST to an unknown path with a non-JSON body', async () => {
+    const { app } = build();
+    const res = await request(app).post('/nope').set('Content-Type', 'text/plain').send('x');
+    expect(res.status).toBe(404);
+  });
+
+  it('415 is still returned for the real endpoint with a non-JSON body', async () => {
+    const { app } = build();
+    expect((await request(app).post('/secure-inquiry').set('Content-Type', 'text/plain').send('x')).status).toBe(415);
+  });
+
+  it('wrong-method requests never touch the provider, breaker or audit log', async () => {
+    const provider = stubProvider();
+    const { app, breaker } = build({ provider });
+    await request(app).get('/secure-inquiry');
+    expect(provider.received).toHaveLength(0);
+    expect(breaker.state).toBe('CLOSED');
+    expect(await records()).toHaveLength(0);
+  });
+});
+
+describe('review #18: response headers', () => {
+  it.each([
+    ['success', () => post(build().app)],
+    ['400', () => post(build().app, { userId: 'u' })],
+    ['404', () => request(build().app).get('/nope')],
+    ['health', () => request(build().app).get('/health')],
+  ])('sets no-store, nosniff and a locked-down CSP on %s responses', async (_label, send) => {
+    const res = await send();
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.headers['content-security-policy']).toContain("default-src 'none'");
+    expect(res.headers['x-powered-by']).toBeUndefined();
+  });
+});
+
+describe('review #8: concurrency cap', () => {
+  it('a burst against a hanging provider reaches it at most maxConcurrent times; the rest get Service Busy at once', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const provider = stubProvider(async () => {
+      await gate;
+      return 'Generated Answer';
+    });
+    const { app, breaker } = build({ provider, maxConcurrent: 3 });
+
+    const done: Array<{ status: number; body: Record<string, unknown> }> = [];
+    const inflight = Array.from({ length: 8 }, () => post(app).then((r) => (done.push({ status: r.status, body: r.body }), r)));
+    await vi.waitFor(() => expect(done).toHaveLength(5)); // the 5 over the cap answer immediately
+    expect(provider.received).toHaveLength(3);
+    expect(done.every((d) => d.status === 503 && d.body.status === 'overloaded' && d.body.error === 'Service Busy')).toBe(true);
+    expect(breaker.state).toBe('CLOSED'); // being busy is not a provider failure
+
+    release();
+    const all = await Promise.all(inflight);
+    expect(all.filter((r) => r.status === 200)).toHaveLength(3);
+    const statuses = (await records()).map((r) => r.providerStatus).sort();
+    expect(statuses).toEqual(['overloaded', 'overloaded', 'overloaded', 'overloaded', 'overloaded', 'success', 'success', 'success']);
+  });
+
+  it('sends a Retry-After on overload responses', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const provider = stubProvider(() => gate.then(() => 'x'));
+    const { app } = build({ provider, maxConcurrent: 1 });
+    const first = post(app).then((r) => r); // supertest requests are lazy: .then() sends it
+    await vi.waitFor(() => expect(provider.received).toHaveLength(1)); // the only slot is now taken
+    const res = await post(app);
+    expect(res.status).toBe(503);
+    expect(res.headers['retry-after']).toBe('1');
+    release();
+    await first;
+  });
+});
+
+describe('review #15: provider timeout aborts the provider call', () => {
+  it('aborts the signal handed to the provider when the call times out', async () => {
+    const provider = stubProvider(() => new Promise<string>(() => undefined));
+    const { app } = build({ provider, timeoutMs: 20 });
+    const res = await post(app);
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('failed');
+    expect(provider.signals[0]?.aborted).toBe(true);
+  });
+});
+
+describe('review #7: backpressure and rate limiting', () => {
+  it('answers 503 Service Busy (not 500) when the audit queue is full, and recovers', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started = 0;
+    const auditLog = createAuditLog({
+      filePath: file,
+      key,
+      maxPending: 1,
+      appendFile: async () => {
+        started++;
+        await gate;
+      },
+    });
+    const { app } = build({ auditLog });
+
+    const first = post(app).then((r) => r); // its audit write occupies the only slot
+    await vi.waitFor(() => expect(started).toBe(1));
+    const res = await post(app);
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ requestId: expect.stringMatching(UUID), status: 'overloaded', error: 'Service Busy' });
+    expect(res.headers['retry-after']).toBe('1');
+    release();
+    expect((await first).status).toBe(200);
+    expect((await post(app)).status).toBe(200); // capacity is back
+  });
+
+  it('answers a generic 500 when the audit file is full, without leaking anything', async () => {
+    const auditLog = createAuditLog({ filePath: file, key, maxFileBytes: 200 });
+    const { app } = build({ auditLog });
+    expect((await post(app)).status).toBe(500); // one record is bigger than 200 bytes
+    const res = await post(app, { userId: 'u1', message: PII_MESSAGE });
+    expect(res.body).toEqual({ requestId: expect.stringMatching(UUID), status: 'error', error: 'Internal Server Error' });
+    expectNoPii(res.body);
+    expectNoPii(logs);
+  });
+
+  it('rate-limits per client with 429 and Retry-After, counting invalid requests too, but not /health', async () => {
+    const { app } = build({ rateLimit: { max: 3, windowMs: 60_000 } });
+    expect((await post(app)).status).toBe(200);
+    expect((await post(app, { userId: 'u' })).status).toBe(400); // still counts
+    expect((await post(app)).status).toBe(200);
+    const limited = await post(app);
+    expect(limited.status).toBe(429);
+    expect(limited.headers['retry-after']).toBeDefined();
+    expect(limited.body).toEqual({ requestId: expect.stringMatching(UUID), status: 'rate_limited', error: 'Too Many Requests' });
+    expect((await request(app).get('/health')).status).toBe(200);
+  });
+
+  it('rate-limited requests never reach the provider or the audit log', async () => {
+    const provider = stubProvider();
+    const { app } = build({ provider, rateLimit: { max: 1, windowMs: 60_000 } });
+    await post(app);
+    await post(app);
+    await post(app);
+    expect(provider.received).toHaveLength(1);
+    expect(await records()).toHaveLength(1);
+  });
+});
+
+describe('review #6: integration — stored records are tamper-evident', () => {
+  it('editing any plaintext field of a stored record breaks decryption', async () => {
+    const { app } = build();
+    await post(app, { userId: 'user-123', message: PII_MESSAGE });
+    const [rec] = await records();
+    expect(open(rec!)).toBe(PII_MESSAGE);
+    expect(() => open({ ...rec!, providerStatus: 'failed' })).toThrow();
+    expect(() => open({ ...rec!, redactedMessage: 'clean' })).toThrow();
+    expect(() => open({ ...rec!, userId: 'user-999' })).toThrow();
   });
 });

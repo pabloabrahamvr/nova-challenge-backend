@@ -1,17 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import express, { type ErrorRequestHandler, type Express, type RequestHandler } from 'express';
 import type { AiProvider } from './aiProvider.js';
-import type { AuditLog } from './auditStore.js';
+import { AuditWriteError, type AuditLog } from './auditStore.js';
 import type { CircuitBreaker } from './circuitBreaker.js';
+import { createRateLimiter, type RateLimitOptions } from './rateLimit.js';
 import { createSecureInquiryRouter, type Logger } from './routes/secureInquiry.js';
-
-export const BODY_LIMIT = '16kb'; // 4000 chars of 4-byte UTF-8 plus JSON overhead
 
 export interface AppDeps {
   auditLog: AuditLog;
   provider: AiProvider;
   breaker: CircuitBreaker;
-  providerTimeoutMs: number;
+  /** Per-IP rate limit on POST /secure-inquiry. Omit (or max <= 0) to disable. */
+  rateLimit?: RateLimitOptions;
   log?: Logger;
 }
 
@@ -28,26 +28,36 @@ export function createApp(deps: AppDeps): Express {
     next();
   };
 
-  const requireJson: RequestHandler = (req, res, next) => {
-    if (req.method === 'POST' && !req.is('application/json')) {
-      res.status(415).json({ requestId: res.locals.requestId, status: 'invalid_request', error: 'Unsupported Media Type' });
-      return;
-    }
+  // Responses are JSON API payloads: never sniffed, never cached by intermediaries or browsers.
+  const securityHeaders: RequestHandler = (_req, res, next) => {
+    res.set({
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+    });
     next();
   };
 
   app.use(assignRequestId);
-  app.get('/health', (_req, res) => {
-    res.json({ status: 'ok' });
-  });
-  app.use(requireJson);
-  app.use(express.json({ limit: BODY_LIMIT }));
+  app.use(securityHeaders);
+
+  app
+    .route('/health')
+    .get((_req, res) => {
+      res.json({ status: 'ok' });
+    })
+    .all((_req, res) => {
+      res.status(405).set('Allow', 'GET, HEAD').json({ requestId: res.locals.requestId, status: 'error', error: 'Method Not Allowed' });
+    });
+
+  if (deps.rateLimit && deps.rateLimit.max > 0) {
+    app.use('/secure-inquiry', createRateLimiter(deps.rateLimit));
+  }
   app.use(
     createSecureInquiryRouter({
       auditLog: deps.auditLog,
       provider: deps.provider,
       breaker: deps.breaker,
-      providerTimeoutMs: deps.providerTimeoutMs,
       log,
     }),
   );
@@ -61,24 +71,25 @@ export function createApp(deps: AppDeps): Express {
   const errorHandler: ErrorRequestHandler = (err: unknown, _req, res, _next) => {
     const e = err as { status?: unknown; name?: unknown; code?: unknown };
     const requestId = res.locals.requestId as string;
-    const parserStatus = typeof e.status === 'number' && e.status >= 400 && e.status < 500 ? e.status : undefined;
+    const clientStatus = typeof e.status === 'number' && e.status >= 400 && e.status < 500 ? e.status : undefined;
 
-    if (parserStatus !== undefined) {
-      const error = parserStatus === 413 ? 'Payload Too Large' : parserStatus === 415 ? 'Unsupported Media Type' : 'Bad Request';
-      const status = parserStatus === 413 || parserStatus === 415 ? parserStatus : 400;
+    if (clientStatus !== undefined) {
+      const error = clientStatus === 413 ? 'Payload Too Large' : clientStatus === 415 ? 'Unsupported Media Type' : 'Bad Request';
+      const status = clientStatus === 413 || clientStatus === 415 ? clientStatus : 400;
       log({ event: 'bad_request', requestId, status });
       res.status(status).json({ requestId, status: 'invalid_request', error });
       return;
     }
 
-    log({
-      event: 'unhandled_error',
-      requestId,
-      errorName: typeof e.name === 'string' ? e.name : 'Error',
-      errorCode: typeof e.code === 'string' ? e.code : undefined,
-    });
+    const code = typeof e.code === 'string' ? e.code : undefined;
+    log({ event: 'unhandled_error', requestId, errorName: typeof e.name === 'string' ? e.name : 'Error', errorCode: code });
     if (res.headersSent) {
       res.end();
+      return;
+    }
+    // The audit queue is full: we are overloaded, not broken. Tell clients to back off.
+    if (err instanceof AuditWriteError && code === 'QUEUE_FULL') {
+      res.status(503).set('Retry-After', '1').json({ requestId, status: 'overloaded', error: 'Service Busy' });
       return;
     }
     res.status(500).json({ requestId, status: 'error', error: 'Internal Server Error' });

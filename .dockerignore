@@ -2,9 +2,13 @@
 .env
 .env.*
 !.env.example
+secrets/
+*.pem
+*.key
 data/
 *.jsonl
 *.log
+*.bak
 
 node_modules/
 dist/
@@ -13,9 +17,7 @@ coverage/
 .git/
 .DS_Store
 .claude/
+.github/
 CLAUDE.md
 PROMPTS.md
 README.md
-Dockerfile
-compose.yaml
-.dockerignore

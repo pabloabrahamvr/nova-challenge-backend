@@ -50,3 +50,97 @@ describe('loadConfig', () => {
     );
   });
 });
+
+// ---- Security review regressions ----
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll } from 'vitest';
+
+describe('review #11: blank or malformed numbers never become 0', () => {
+  const base = { AUDIT_ENCRYPTION_KEY: KEY };
+
+  it.each([
+    ['BREAKER_COOLDOWN_MS', 'breakerCooldownMs', 10_000],
+    ['PROVIDER_DELAY_MS', 'providerDelayMs', 2000],
+    ['PROVIDER_TIMEOUT_MS', 'providerTimeoutMs', 5000],
+    ['BREAKER_FAILURE_THRESHOLD', 'breakerFailureThreshold', 3],
+    ['PORT', 'port', 3000],
+    ['RATE_LIMIT_MAX', 'rateLimitMax', 300],
+  ] as const)('%s= (empty) and whitespace fall back to the default %s', (name, field, def) => {
+    expect(loadConfig({ ...base, [name]: '' })[field]).toBe(def);
+    expect(loadConfig({ ...base, [name]: '   ' })[field]).toBe(def);
+  });
+
+  it.each([
+    ['cooldown of 0 (would disable the breaker)', { BREAKER_COOLDOWN_MS: '0' }],
+    ['port 0', { PORT: '0' }],
+    ['port above 65535', { PORT: '70000' }],
+    ['negative', { PROVIDER_DELAY_MS: '-1' }],
+    ['exponent notation', { PROVIDER_DELAY_MS: '1e3' }],
+    ['hex', { PROVIDER_DELAY_MS: '0x10' }],
+    ['decimal', { PROVIDER_DELAY_MS: '1.5' }],
+    ['trailing text', { PROVIDER_DELAY_MS: '10ms' }],
+    ['timeout of 0', { PROVIDER_TIMEOUT_MS: '0' }],
+    ['concurrency of 0', { PROVIDER_MAX_CONCURRENCY: '0' }],
+    ['absurdly large', { PROVIDER_DELAY_MS: '99999999999999' }],
+  ])('rejects %s', (_label, extra) => {
+    const name = Object.keys(extra)[0]!;
+    expect(() => loadConfig({ ...base, ...extra })).toThrow(ConfigError);
+    expect(() => loadConfig({ ...base, ...extra })).toThrow(new RegExp(name));
+  });
+
+  it('accepts RATE_LIMIT_MAX=0 (explicitly disabled)', () => {
+    expect(loadConfig({ ...base, RATE_LIMIT_MAX: '0' }).rateLimitMax).toBe(0);
+  });
+
+  it('rejects a low-entropy key', () => {
+    expect(() => loadConfig({ AUDIT_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64') })).toThrow(ConfigError);
+  });
+});
+
+describe('review #9: key from a secret file (Docker/K8s secrets)', () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'cfg-test-'));
+  });
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('reads the key from AUDIT_ENCRYPTION_KEY_FILE, ignoring a trailing newline', async () => {
+    const file = join(dir, 'key');
+    await writeFile(file, `${KEY}\n`);
+    const c = loadConfig({ AUDIT_ENCRYPTION_KEY_FILE: file });
+    expect(c.encryptionKey.toString('base64')).toBe(KEY);
+  });
+
+  it('rejects setting both the inline key and the file', async () => {
+    const file = join(dir, 'key2');
+    await writeFile(file, KEY);
+    expect(() => loadConfig({ AUDIT_ENCRYPTION_KEY: KEY, AUDIT_ENCRYPTION_KEY_FILE: file })).toThrow(/only one/);
+  });
+
+  it('reports an unreadable file without leaking its path', () => {
+    const missing = join(dir, 'does-not-exist');
+    try {
+      loadConfig({ AUDIT_ENCRYPTION_KEY_FILE: missing });
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
+      expect((e as Error).message).not.toContain(missing);
+    }
+  });
+
+  it('rejects a malformed key inside the file without echoing it', async () => {
+    const file = join(dir, 'bad');
+    const bad = randomBytes(16).toString('base64');
+    await writeFile(file, bad);
+    try {
+      loadConfig({ AUDIT_ENCRYPTION_KEY_FILE: file });
+      expect.unreachable();
+    } catch (e) {
+      expect((e as Error).message).not.toContain(bad);
+    }
+  });
+});

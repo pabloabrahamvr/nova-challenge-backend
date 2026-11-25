@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { CryptoError, decrypt, encrypt, loadKey } from '../src/crypto.js';
+import { CryptoError, encrypt, loadKey } from '../src/crypto.js';
+import { decrypt } from './helpers/crypto.js';
 
 const key = randomBytes(32);
 const AAD = 'req-1';
@@ -13,7 +14,7 @@ const flip = (b64: string): string => {
 };
 
 describe('loadKey', () => {
-  it('accepts a 32-byte base64 key', () => {
+  it('accepts a 32-byte random base64 key', () => {
     expect(loadKey(key.toString('base64')).equals(key)).toBe(true);
   });
 
@@ -28,18 +29,30 @@ describe('loadKey', () => {
     expect(() => loadKey(value)).toThrow(CryptoError);
   });
 
+  // review #17: weak keys
+  it.each([
+    ['all zero bytes', Buffer.alloc(32, 0)],
+    ['all 0xff bytes', Buffer.alloc(32, 0xff)],
+    ['repeating 2-byte pattern', Buffer.from('abababababababababababababababab')],
+    ['ASCII counter (only 10 distinct bytes)', Buffer.from('01234567890123456789012345678901')],
+  ])('rejects a low-entropy key: %s', (_label, bytes) => {
+    expect(bytes).toHaveLength(32);
+    expect(() => loadKey(bytes.toString('base64'))).toThrow(CryptoError);
+  });
+
   it('never echoes the bad value in the error', () => {
-    const bad = randomBytes(16).toString('base64');
-    try {
-      loadKey(bad);
-      expect.unreachable();
-    } catch (e) {
-      expect((e as Error).message).not.toContain(bad);
+    for (const bad of [randomBytes(16).toString('base64'), Buffer.alloc(32, 7).toString('base64')]) {
+      try {
+        loadKey(bad);
+        expect.unreachable();
+      } catch (e) {
+        expect((e as Error).message).not.toContain(bad);
+      }
     }
   });
 });
 
-describe('encrypt / decrypt', () => {
+describe('encrypt / decrypt (independent test-side decrypt)', () => {
   it('round-trips with the authorized key', () => {
     expect(decrypt(encrypt(SECRET, key, AAD), key, AAD)).toBe(SECRET);
   });
@@ -70,6 +83,11 @@ describe('encrypt / decrypt', () => {
     expect(json).not.toContain('123-45-6789');
     expect(json).not.toContain('john@example.com');
   });
+
+  it('exposes no decrypt function from the production module', async () => {
+    const mod = await import('../src/crypto.js');
+    expect(Object.keys(mod)).not.toContain('decrypt');
+  });
 });
 
 describe('tamper detection', () => {
@@ -85,7 +103,7 @@ describe('tamper detection', () => {
     ['wrong key', p, randomBytes(32), AAD],
     ['wrong alg label', { ...p, alg: 'aes-128-cbc' as never }, key, AAD],
   ])('rejects %s', (_label, payload, k, aad) => {
-    expect(() => decrypt(payload, k, aad)).toThrow(new CryptoError('Decryption failed'));
+    expect(() => decrypt(payload, k, aad)).toThrow('Decryption failed');
   });
 
   it('failure message leaks neither plaintext nor key', () => {

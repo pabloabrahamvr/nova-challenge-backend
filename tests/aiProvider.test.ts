@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderError, createMockProvider, withTimeout } from '../src/aiProvider.js';
+import { ProviderError, createMockProvider } from '../src/aiProvider.js';
 
 describe('mock provider', () => {
   it('returns "Generated Answer" after the configured delay', async () => {
@@ -24,12 +24,19 @@ describe('mock provider', () => {
   });
 });
 
-describe('withTimeout', () => {
-  it('rejects with ProviderError when the promise is too slow', async () => {
-    await expect(withTimeout(new Promise(() => undefined), 20)).rejects.toBeInstanceOf(ProviderError);
+describe('abort signal', () => {
+  it('stops waiting and rejects when the signal is aborted', async () => {
+    const provider = createMockProvider({ delayMs: 10_000, failFirstN: 0 });
+    const controller = new AbortController();
+    const pending = provider.generate('x', controller.signal);
+    setTimeout(() => controller.abort(), 10);
+    const start = performance.now();
+    await expect(pending).rejects.toBeInstanceOf(ProviderError);
+    expect(performance.now() - start).toBeLessThan(1000);
   });
-  it('passes through results and errors', async () => {
-    await expect(withTimeout(Promise.resolve(1), 1000)).resolves.toBe(1);
-    await expect(withTimeout(Promise.reject(new Error('x')), 1000)).rejects.toThrow('x');
+
+  it('rejects immediately for an already-aborted signal', async () => {
+    const provider = createMockProvider({ delayMs: 10_000, failFirstN: 0 });
+    await expect(provider.generate('x', AbortSignal.abort())).rejects.toBeInstanceOf(ProviderError);
   });
 });
